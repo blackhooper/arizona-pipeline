@@ -1,0 +1,133 @@
+# Corre la actualización de datos con el código de un repo privado y guarda el resultado en otro repo privado.
+# Este repo es público a propósito (Actions gratis): no contiene datos ni código del proyecto, solo este flujo.
+# La salida de cada paso se descarta: aquí solo se ve «paso NN/total: ok». Los detalles quedan en el repo privado de datos.
+# Corre el día 5 de cada mes y a mano («Run workflow»). Necesita los secrets PUBLICAR_TOKEN y CENSUS_API_KEY.
+name: Actualizar datos
+
+on:
+  schedule:
+    - cron: "0 9 5 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actualizar-datos
+  cancel-in-progress: false
+
+env:
+  DATOS_DIR: ${{ github.workspace }}/datos/fuentes
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: blackhooper/arizona-datos
+          token: ${{ secrets.PUBLICAR_TOKEN }}
+          path: datos
+      - uses: actions/checkout@v4
+        with:
+          repository: blackhooper/ARIZONA-S-SOFTWARE-
+          token: ${{ secrets.PUBLICAR_TOKEN }}
+          path: app
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Vencimiento del token
+        # GitHub informa en un encabezado cuándo vence el token; si faltan menos de 14 días queda como «revisar» en el panel
+        working-directory: app
+        env:
+          GH_TOKEN: ${{ secrets.PUBLICAR_TOKEN }}
+        run: |
+          exp=$(curl -sI -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/blackhooper/ARIZONA-S-SOFTWARE- \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="github-authentication-token-expiration"{print $2}')
+          python3 - "$exp" >/dev/null 2>&1 <<'PY'
+          import sys, datetime as dt
+          sys.path.insert(0, "pipeline")
+          import estado
+          exp = sys.argv[1].strip()
+          if not exp:
+              estado.registrar("token_publicacion", "ok", "token sin vencimiento")
+          else:
+              vence = dt.datetime.strptime(exp[:10], "%Y-%m-%d").date()
+              dias = (vence - dt.date.today()).days
+              estado.registrar("token_publicacion", "ok" if dias > 14 else "revisar",
+                               f"vence el {vence} (en {dias} días): renovar PUBLICAR_TOKEN" if dias <= 14 else f"vence el {vence}",
+                               vence=str(vence), dias=dias)
+          PY
+      - name: Pasos de datos
+        working-directory: app
+        env:
+          CENSUS_API_KEY: ${{ secrets.CENSUS_API_KEY }}
+        run: python pipeline/correr_pasos.py actualizar
+      - name: Guardar en el repo de datos
+        if: always()
+        working-directory: datos
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fuentes/
+          git diff --cached --quiet || { git commit -q -m "Datos: corrida del $(date -u +%F)"; git pull --rebase -X theirs --quiet; git push -q; }
+      - name: Publicar en la página
+        working-directory: app
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp "$DATOS_DIR/estado.json" app/static/estado_datos.json
+          git add app/static/
+          git diff --cached --quiet || { git commit -q -m "Datos: publicados desde arizona-datos el $(date -u +%F) [skip ci]"; git pull --rebase -X theirs --quiet; git push -q; }
+
+  tiempos:
+    # tiempos de viaje y alcance: lento (mosaicos de Valhalla y miles de rutas); corre después de todo lo anterior
+    needs: actualizar
+    if: ${{ always() && needs.actualizar.result != 'cancelled' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      VALHALLA_DIR: ${{ github.workspace }}/valhalla
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: blackhooper/arizona-datos
+          token: ${{ secrets.PUBLICAR_TOKEN }}
+          path: datos
+      - uses: actions/checkout@v4
+        with:
+          repository: blackhooper/ARIZONA-S-SOFTWARE-
+          token: ${{ secrets.PUBLICAR_TOKEN }}
+          path: app
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Mes (para la caché de la red vial)
+        id: mes
+        run: echo "mes=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+      - name: Red vial (caché mensual)
+        uses: actions/cache@v4
+        with:
+          path: valhalla
+          key: valhalla-az-${{ steps.mes.outputs.mes }}
+      - name: Pasos de tiempos
+        working-directory: app
+        run: python pipeline/correr_pasos.py tiempos
+      - name: Guardar en el repo de datos
+        if: always()
+        working-directory: datos
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fuentes/
+          git diff --cached --quiet || { git commit -q -m "Datos: tiempos de viaje del $(date -u +%F)"; git pull --rebase -X theirs --quiet; git push -q; }
+      - name: Publicar en la página
+        if: always()
+        working-directory: app
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp "$DATOS_DIR/estado.json" app/static/estado_datos.json
+          git add app/static/
+          git diff --cached --quiet || { git commit -q -m "Datos: tiempos de viaje publicados el $(date -u +%F) [skip ci]"; git pull --rebase -X theirs --quiet; git push -q; }
