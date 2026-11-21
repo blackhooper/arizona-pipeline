@@ -118,6 +118,21 @@ jobs:
         with:
           path: valhalla
           key: valhalla-az-${{ steps.mes.outputs.mes }}
+      - name: Extracto de OpenStreetMap (si no hay caché)
+        # el servidor a veces responde 404 o «red no alcanzable» desde los runners: se fuerza IPv4 y se reintenta
+        run: |
+          if [ -n "$(find valhalla/tiles -name '*.gph' -print -quit 2>/dev/null)" ]; then echo "caché de la red vial: ok"; exit 0; fi
+          destino="$RUNNER_TEMP/arizona.osm.pbf"
+          bajado=0
+          for url in https://download.geofabrik.de/north-america/us/arizona-latest.osm.pbf; do
+            for intento in 1 2 3 4 5 6; do
+              codigo=$(curl -4 -sSL --connect-timeout 30 -o "$destino" -w '%{http_code}' "$url" || true)
+              if [ "$codigo" = "200" ] && [ -s "$destino" ]; then bajado=1; break 2; fi
+              echo "intento $intento: respuesta $codigo"; rm -f "$destino"; sleep 120
+            done
+          done
+          [ "$bajado" = "1" ] || { echo "no se pudo bajar el extracto"; exit 1; }
+          echo "OSM_PBF=$destino" >> "$GITHUB_ENV"
       - name: Pasos de tiempos
         working-directory: app
         run: python pipeline/correr_pasos.py tiempos
