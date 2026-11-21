@@ -8,6 +8,12 @@ on:
   schedule:
     - cron: "0 9 5 * *"
   workflow_dispatch:
+    inputs:
+      solo:
+        description: "Qué correr a mano"
+        type: choice
+        default: todo
+        options: [todo, tiempos]
 
 permissions:
   contents: read
@@ -21,6 +27,7 @@ env:
 
 jobs:
   actualizar:
+    if: ${{ inputs.solo != 'tiempos' }}
     runs-on: ubuntu-latest
     timeout-minutes: 330
     steps:
