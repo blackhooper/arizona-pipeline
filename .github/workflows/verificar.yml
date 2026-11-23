@@ -1,7 +1,7 @@
 # Verificación de la página (pipeline/verificar.py): sintaxis, JSON y GeoJSON, que el visor se arme con todas las capas,
 # idioma (traducciones, ortografía inglesa, español en pantalla) y que el mapa cargue con MapLibre real.
 # Antes corría en el repo privado de la página y gastaba sus minutos de Actions; aquí los minutos son gratis.
-# Cada 15 minutos revisa los PR abiertos y main: cada commit nuevo se verifica una vez y su resultado se marca en GitHub como
+# Cada 15 minutos revisa la punta de cada rama de la página (las de los PR y main): cada commit nuevo se verifica una vez y su resultado se marca en GitHub como
 # estado «Verificar (repo público)» del commit (visible en el PR). La salida del script NO se imprime aquí (repo público): si falla,
 # las últimas líneas quedan en el repo privado de datos (fuentes/verificacion/<commit>.log).
 # Necesita PUBLICAR_TOKEN con «Commit statuses: lectura y escritura» sobre la página, además de Contents.
@@ -35,15 +35,22 @@ jobs:
     steps:
       - name: Commits por verificar
         id: lista
+        env:
+          COMMIT: ${{ inputs.commit }}
         run: |
-          if [ -n "${{ inputs.commit }}" ]; then shas="${{ inputs.commit }}"; else
-            shas=$( { gh api "repos/$PAGINA/pulls?state=open&per_page=100" --jq '.[].head.sha'; gh api "repos/$PAGINA/commits/main" --jq .sha; } | sort -u )
+          if [ -n "$COMMIT" ]; then shas="$COMMIT"; else
+            # la punta de cada rama (incluye las de los PR) sin las de respaldo; solo necesita permiso de lectura de contenido
+            shas=$(gh api "repos/$PAGINA/branches?per_page=100" --paginate --jq '.[] | select(.name | startswith("respaldo/") | not) | .commit.sha' | sort -u)
           fi
           pendientes=""
           for s in $shas; do
+            [[ "$s" =~ ^[0-9a-f]{40}$ ]] || continue
             ya=$(gh api "repos/$PAGINA/commits/$s/statuses?per_page=100" --jq "[.[] | select(.context == \"$CONTEXTO\" and .state != \"pending\")] | length" 2>/dev/null || echo 0)
-            if [ "$ya" = "0" ] || [ -n "${{ inputs.commit }}" ]; then pendientes="$pendientes $s"; fi
+            if [ "$ya" = "0" ] || [ -n "$COMMIT" ]; then pendientes="$pendientes $s"; fi
           done
+          # main primero y como mucho 6 por corrida (cada una tarda 1 a 2 min); el resto entra en la siguiente
+          principal=$(gh api "repos/$PAGINA/commits/main" --jq .sha)
+          pendientes=$( { echo "$pendientes" | tr ' ' '\n' | grep -x "$principal" || true; echo "$pendientes" | tr ' ' '\n' | grep -vx "$principal" | grep . || true; } | head -n 6 | tr '\n' ' ')
           echo "shas=$pendientes" >> "$GITHUB_OUTPUT"
           echo "commits por verificar: $(echo $pendientes | wc -w)"
       - uses: actions/setup-python@v5
@@ -73,13 +80,14 @@ jobs:
         if: steps.lista.outputs.shas != ''
         env:
           IDIOMA_PANTALLA: "1"
+          SHAS: ${{ steps.lista.outputs.shas }}
         run: |
           mkdir -p datos/fuentes/verificacion
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # una sola copia de la página; cada commit se baja encima (solo cambia lo distinto)
           mkdir pagina && git -C pagina init -q && git -C pagina remote add origin "https://x-access-token:${GH_TOKEN}@github.com/$PAGINA.git"
-          for s in ${{ steps.lista.outputs.shas }}; do
+          for s in $SHAS; do
             corto=${s:0:7}
             gh api "repos/$PAGINA/statuses/$s" -f state=pending -f context="$CONTEXTO" -f description="verificando" > /dev/null
             cd pagina
