@@ -113,31 +113,47 @@ jobs:
       - name: Mes (para la caché de la red vial)
         id: mes
         run: echo "mes=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
-      - name: Red vial (caché mensual)
-        uses: actions/cache@v4
+      - name: Red vial (caché del mes)
+        id: cache
+        uses: actions/cache/restore@v4
         with:
           path: valhalla
           key: valhalla-az-v2-${{ steps.mes.outputs.mes }}
       - name: Extracto de OpenStreetMap (si no hay caché)
-        # el servidor a veces responde 404 o «red no alcanzable» desde los runners: se fuerza IPv4 y se reintenta
+        id: extracto
+        # misma condición que pipeline/tiempos_viaje.py: mosaicos .gph Y origen.json; si no, el script bajaba el extracto por su cuenta
+        # (sin IPv4) y fallaba con «Network is unreachable». Si ninguna fuente responde, se usan los mosaicos del mes anterior.
         run: |
-          if [ -n "$(find valhalla/tiles -name '*.gph' -print -quit 2>/dev/null)" ]; then echo "caché de la red vial: ok"; exit 0; fi
+          if [ -f valhalla/origen.json ] && [ -n "$(find valhalla/tiles -name '*.gph' -print -quit 2>/dev/null)" ]; then echo "caché de la red vial: ok"; exit 0; fi
           destino="$RUNNER_TEMP/arizona.osm.pbf"
-          bajado=0
-          # varias fuentes del mismo extracto (Geofabrik y sus espejos); cada intento anota el código y la redirección
           for url in https://download.geofabrik.de/north-america/us/arizona-latest.osm.pbf https://ftp5.gwdg.de/pub/misc/openstreetmap/download.geofabrik.de/north-america/us/arizona-latest.osm.pbf https://ftp.fau.de/osm-data/download.geofabrik.de/north-america/us/arizona-latest.osm.pbf https://download.openstreetmap.fr/extracts/north-america/us/arizona.osm.pbf; do
             for intento in 1 2; do
-              codigo=$(curl -4 -sS -L --max-redirs 5 -A 'Mozilla/5.0 (X11; Linux x86_64) arizona-pipeline' --connect-timeout 30 -o "$destino" -w '%{http_code} %{url_effective}' "$url" || true)
-              echo "${url%%/*}//$(echo "$url" | cut -d/ -f3) intento $intento: $codigo"
-              if [ "${codigo%% *}" = "200" ] && [ "$(stat -c %s "$destino" 2>/dev/null || echo 0)" -gt 50000000 ]; then bajado=1; break 2; fi
+              codigo=$(curl -4 -sS -L --max-redirs 5 -A 'Mozilla/5.0 (X11; Linux x86_64) arizona-pipeline' --connect-timeout 30 -o "$destino" -w '%{http_code}' "$url" || true)
+              echo "$(echo "$url" | cut -d/ -f3) intento $intento: $codigo"
+              if [ "$codigo" = "200" ] && [ "$(stat -c %s "$destino" 2>/dev/null || echo 0)" -gt 50000000 ]; then
+                echo "OSM_PBF=$destino" >> "$GITHUB_ENV"; echo "nuevo=1" >> "$GITHUB_OUTPUT"; exit 0
+              fi
               rm -f "$destino"; sleep 15
             done
           done
-          [ "$bajado" = "1" ] || { echo "no se pudo bajar el extracto"; exit 1; }
-          echo "OSM_PBF=$destino" >> "$GITHUB_ENV"
+          echo "no se pudo bajar el extracto: se prueban los mosaicos del mes anterior"
+          echo "anterior=1" >> "$GITHUB_OUTPUT"
+      - name: Red vial del mes anterior (respaldo)
+        if: steps.extracto.outputs.anterior == '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: valhalla
+          key: valhalla-az-v2-${{ steps.mes.outputs.mes }}
+          restore-keys: valhalla-az-v2-
       - name: Pasos de tiempos
         working-directory: app
         run: python pipeline/correr_pasos.py tiempos
+      - name: Guardar la red vial del mes
+        if: steps.extracto.outputs.nuevo == '1' && hashFiles('valhalla/origen.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: valhalla
+          key: valhalla-az-v2-${{ steps.mes.outputs.mes }}
       - name: Guardar en el repo de datos
         if: always()
         working-directory: datos
