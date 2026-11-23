@@ -1,0 +1,62 @@
+# Terreno: baja el modelo de elevación del USGS 3DEP de Arizona, genera las teselas y las publica en la página.
+# Antes vivía en el repo privado de datos (gastaba minutos de Actions); aquí los minutos son gratis.
+# Corre cada 1 de septiembre (el 3DEP se actualiza por partes durante el año) y a mano. Necesita el secret PUBLICAR_TOKEN.
+# La salida del script se descarta: aquí solo se ve si terminó bien. El detalle queda en el repo privado de datos (estado.json).
+name: Terreno 3DEP
+
+on:
+  schedule:
+    - cron: "0 8 1 9 *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actualizar-datos
+  cancel-in-progress: false
+
+env:
+  DATOS_DIR: ${{ github.workspace }}/datos/fuentes
+
+jobs:
+  terreno:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: blackhooper/arizona-datos
+          token: ${{ secrets.PUBLICAR_TOKEN }}
+          path: datos
+      - uses: actions/checkout@v4
+        with:
+          repository: blackhooper/ARIZONA-S-SOFTWARE-
+          token: ${{ secrets.PUBLICAR_TOKEN }}
+          path: app
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Teselas de elevación (USGS 3DEP)
+        working-directory: app
+        # dos pasadas, como en la acción original: la segunda completa lo que la primera no alcanzó a bajar
+        run: |
+          pip install --quiet rasterio shapely numpy pillow
+          python pipeline/terreno_3dep.py > /dev/null 2>&1 || true
+          python pipeline/terreno_3dep.py > /dev/null 2>&1 && echo "terreno: ok" || { echo "terreno: fallo (detalle en el repo de datos)"; exit 1; }
+      - name: Guardar en el repo de datos (también si falló, para dejar el estado)
+        if: always()
+        working-directory: datos
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fuentes/
+          git diff --cached --quiet || { git commit -q -m "Terreno 3DEP: corrida del $(date -u +%F)"; git pull --rebase -X theirs --quiet; git push -q; }
+      - name: Publicar en la página
+        working-directory: app
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp "$DATOS_DIR/estado.json" app/static/estado_datos.json
+          git add app/static/
+          git diff --cached --quiet || { git commit -q -m "Datos: terreno 3DEP publicado el $(date -u +%F) [skip ci]"; git pull --rebase -X theirs --quiet; git push -q; }

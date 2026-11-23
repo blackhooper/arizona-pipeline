@@ -1,0 +1,101 @@
+# Verificación de la página (pipeline/verificar.py): sintaxis, JSON y GeoJSON, que el visor se arme con todas las capas,
+# idioma (traducciones, ortografía inglesa, español en pantalla) y que el mapa cargue con MapLibre real.
+# Antes corría en el repo privado de la página y gastaba sus minutos de Actions; aquí los minutos son gratis.
+# Cada 15 minutos revisa los PR abiertos y main: cada commit nuevo se verifica una vez y su resultado se marca en GitHub como
+# estado «Verificar (repo público)» del commit (visible en el PR). La salida del script NO se imprime aquí (repo público): si falla,
+# las últimas líneas quedan en el repo privado de datos (fuentes/verificacion/<commit>.log).
+# Necesita PUBLICAR_TOKEN con «Commit statuses: lectura y escritura» sobre la página, además de Contents.
+name: Verificar la página
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit de la página a verificar (vacío = PR abiertos y main sin verificar)"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verificar-pagina
+  cancel-in-progress: false
+
+env:
+  PAGINA: blackhooper/ARIZONA-S-SOFTWARE-
+  CONTEXTO: Verificar (repo público)
+  GH_TOKEN: ${{ secrets.PUBLICAR_TOKEN }}
+
+jobs:
+  verificar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Commits por verificar
+        id: lista
+        run: |
+          if [ -n "${{ inputs.commit }}" ]; then shas="${{ inputs.commit }}"; else
+            shas=$( { gh api "repos/$PAGINA/pulls?state=open&per_page=100" --jq '.[].head.sha'; gh api "repos/$PAGINA/commits/main" --jq .sha; } | sort -u )
+          fi
+          pendientes=""
+          for s in $shas; do
+            ya=$(gh api "repos/$PAGINA/commits/$s/statuses?per_page=100" --jq "[.[] | select(.context == \"$CONTEXTO\" and .state != \"pending\")] | length" 2>/dev/null || echo 0)
+            if [ "$ya" = "0" ] || [ -n "${{ inputs.commit }}" ]; then pendientes="$pendientes $s"; fi
+          done
+          echo "shas=$pendientes" >> "$GITHUB_OUTPUT"
+          echo "commits por verificar: $(echo $pendientes | wc -w)"
+      - uses: actions/setup-python@v5
+        if: steps.lista.outputs.shas != ''
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        if: steps.lista.outputs.shas != ''
+        with:
+          node-version: "22"
+      - name: Herramientas (ortografía inglesa y navegador)
+        if: steps.lista.outputs.shas != ''
+        run: |
+          pip install --quiet pyspellchecker
+          npm install --silent --no-save --prefix "$RUNNER_TEMP/pw" playwright > /dev/null 2>&1
+          npx --prefix "$RUNNER_TEMP/pw" playwright install --with-deps chromium > /dev/null 2>&1
+          echo "NODE_PATH=$RUNNER_TEMP/pw/node_modules" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        if: steps.lista.outputs.shas != ''
+        with:
+          repository: blackhooper/arizona-datos
+          token: ${{ secrets.PUBLICAR_TOKEN }}
+          path: datos
+          sparse-checkout: README.md
+          filter: blob:none
+      - name: Verificar cada commit
+        if: steps.lista.outputs.shas != ''
+        env:
+          IDIOMA_PANTALLA: "1"
+        run: |
+          mkdir -p datos/fuentes/verificacion
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # una sola copia de la página; cada commit se baja encima (solo cambia lo distinto)
+          mkdir pagina && git -C pagina init -q && git -C pagina remote add origin "https://x-access-token:${GH_TOKEN}@github.com/$PAGINA.git"
+          for s in ${{ steps.lista.outputs.shas }}; do
+            corto=${s:0:7}
+            gh api "repos/$PAGINA/statuses/$s" -f state=pending -f context="$CONTEXTO" -f description="verificando" > /dev/null
+            cd pagina
+            git fetch -q --depth 1 origin "$s" && git checkout -q -f FETCH_HEAD && git clean -qfdx
+            if python pipeline/verificar.py > "$RUNNER_TEMP/salida.txt" 2>&1; then
+              estado=success; desc="todo en orden"
+            else
+              estado=failure
+              desc=$(grep -m1 -iE "fall|error" "$RUNNER_TEMP/salida.txt" | cut -c1-120)
+              [ -n "$desc" ] || desc="falló: ver fuentes/verificacion/$corto.log en arizona-datos"
+              tail -n 80 "$RUNNER_TEMP/salida.txt" > "../datos/fuentes/verificacion/$corto.log"
+            fi
+            cd ..
+            gh api "repos/$PAGINA/statuses/$s" -f state=$estado -f context="$CONTEXTO" -f description="$desc" > /dev/null
+            echo "commit $corto: $estado"
+          done
+          cd datos
+          git add --sparse fuentes/verificacion 2>/dev/null || true
+          git diff --cached --quiet || { git commit -q -m "Verificación: registros de fallos"; git pull --rebase -X theirs --quiet; git push -q; }
